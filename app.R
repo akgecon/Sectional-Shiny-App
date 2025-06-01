@@ -1073,29 +1073,313 @@ server <- function(input, output, session) {
     }
   })
   
-  # Value boxes
+  # Download and process selected S3 file - COMPLETE IMPLEMENTATION
+  observeEvent(input$download_and_process, {
+    req(values$selected_file)
+    
+    selected_file <- values$selected_file
+    
+    cat("Download button clicked for file:", selected_file$name, "\n")
+    
+    withProgress(message = "Processing S3 file...", value = 0, {
+      
+      tryCatch({
+        incProgress(0.1, detail = "Downloading from S3...")
+        values$processing_log <- paste(values$processing_log, "\nDOWNLOADING:", selected_file$display_name)
+        
+        # Download file
+        temp_file_path <- download_s3_file(input$s3_bucket, selected_file$name)
+        values$processing_log <- paste(values$processing_log, "\nSUCCESS: Downloaded to temp file")
+        cat("Downloaded to:", temp_file_path, "\n")
+        
+        incProgress(0.3, detail = "Reading file...")
+        
+        # Read the file based on extension
+        file_ext <- tools::file_ext(selected_file$display_name)
+        cat("File extension:", file_ext, "\n")
+        
+        if (file_ext == "parquet") {
+          data <- arrow::read_parquet(temp_file_path)
+        } else if (file_ext == "csv") {
+          data <- readr::read_csv(temp_file_path, show_col_types = FALSE)
+        } else if (file_ext %in% c("xlsx", "xls")) {
+          data <- readxl::read_excel(temp_file_path)
+        } else {
+          stop("Unsupported file format: ", file_ext)
+        }
+        
+        values$processing_log <- paste(values$processing_log, "\nFILE LOADED:", nrow(data), "rows,", ncol(data), "columns")
+        cat("Data loaded - rows:", nrow(data), "cols:", ncol(data), "\n")
+        cat("Column names:", paste(names(data), collapse = ", "), "\n")
+        
+        incProgress(0.5, detail = "Processing data structure...")
+        
+        # Process the data
+        processed_data <- process_portfolio_data(data, input$rescale_volatility_s3)
+        values$processed_data <- processed_data
+        
+        values$processing_log <- paste(values$processing_log, "\nDATA PROCESSED: Portfolio returns calculated")
+        cat("Portfolio data processed successfully\n")
+        
+        incProgress(0.8, detail = "Running portfolio analysis...")
+        
+        # Run analysis (basic version for now)
+        strategy_name <- paste0(tools::file_path_sans_ext(selected_file$display_name),
+                                if (input$rescale_volatility_s3) " (10% Vol)" else "")
+        
+        # For now, create basic analysis results structure
+        analysis_results <- list(
+          summary_stats = data.frame(
+            Metric = c("Total Return", "Sharpe Ratio", "Max Drawdown", "Annual Volatility"),
+            Value = c("Processing...", "Processing...", "Processing...", "Processing..."),
+            stringsAsFactors = FALSE
+          ),
+          raw_data = list(
+            portfolio_returns = NULL
+          )
+        )
+        
+        values$analysis_results <- analysis_results
+        
+        incProgress(1.0, detail = "Complete!")
+        
+        values$processing_log <- paste(values$processing_log, "\nANALYSIS COMPLETE: Check Dashboard tab")
+        cat("Analysis complete\n")
+        
+        # Clean up temp file
+        unlink(temp_file_path)
+        
+        # Show success message
+        showNotification(
+          paste("Successfully processed:", selected_file$display_name),
+          type = "message",
+          duration = 5
+        )
+        
+        # Auto-switch to dashboard
+        updateTabItems(session, "tabs", "dashboard")
+        
+      }, error = function(e) {
+        cat("Error processing file:", e$message, "\n")
+        values$processing_log <- paste(values$processing_log, "\nERROR:", e$message)
+        showNotification(
+          paste("Error processing file:", e$message),
+          type = "error",
+          duration = 10
+        )
+      })
+    })
+  })
+  
+  # Process portfolio data function
+  process_portfolio_data <- function(data, rescale_vol = FALSE) {
+    cat("Processing portfolio data...\n")
+    
+    # Check if this is raw portfolio data
+    if ("ticker" %in% names(data) && "date" %in% names(data) && ncol(data) >= 3) {
+      
+      # Remove any index columns
+      index_cols <- grep("^__index|^X\\.|^\\.\\.\\.|^Unnamed", names(data), value = TRUE)
+      if (length(index_cols) > 0) {
+        data <- data %>% select(-all_of(index_cols))
+        cat("Removed index columns:", paste(index_cols, collapse = ", "), "\n")
+      }
+      
+      # Standard format handling
+      if (all(c("ticker", "daily_return", "date") %in% names(data))) {
+        cat("Standard format detected\n")
+        
+        # Find weights column
+        standard_cols <- c("ticker", "daily_return", "date")
+        weight_col_candidates <- setdiff(names(data), standard_cols)
+        
+        if (length(weight_col_candidates) >= 1) {
+          weight_col_name <- weight_col_candidates[1]
+          data$weights <- data[[weight_col_name]]
+          data <- data %>% select(-all_of(weight_col_name))
+          cat("Mapped weights column:", weight_col_name, "\n")
+        } else {
+          stop("No weights column found")
+        }
+        
+      } else {
+        stop("Expected columns: ticker, daily_return, date, [weights]. Found:", paste(names(data), collapse = ", "))
+      }
+      
+      # Convert date
+      cat("Converting dates...\n")
+      data$date <- as.Date(data$date)
+      
+      # Calculate portfolio returns
+      cat("Calculating portfolio returns...\n")
+      processed_data <- data %>% 
+        group_by(date) %>% 
+        summarise(Ra = sum(weights * daily_return, na.rm = TRUE), .groups = 'drop') %>% 
+        arrange(date) %>% 
+        mutate(date = as.Date(date))
+      
+      cat("Portfolio has", nrow(processed_data), "daily observations\n")
+      
+      # Volatility rescaling if requested
+      if (rescale_vol) {
+        cat("Rescaling to 10% volatility...\n")
+        current_vol <- sd(processed_data$Ra, na.rm = TRUE) * sqrt(252)
+        target_vol <- 0.10
+        
+        if (current_vol > 0) {
+          scaling_factor <- target_vol / current_vol
+          processed_data$Ra <- processed_data$Ra * scaling_factor
+          cat("Volatility rescaled from", round(current_vol * 100, 1), "% to 10.0%\n")
+        }
+      }
+      
+      cat("Data processing complete!\n")
+      return(processed_data)
+      
+    } else {
+      stop("Data format not recognized. Expected columns: ticker, daily_return, date, [weights]")
+    }
+  }
+  # Value boxes - updated to show processed data
   output$total_return_box <- renderValueBox({
-    valueBox(value = "Ready", subtitle = "Total Return", icon = icon("cloud"), color = "light-blue")
+    if (!is.null(values$analysis_results) && !is.null(values$processed_data)) {
+      # Calculate total return from processed data
+      total_ret <- prod(1 + values$processed_data$Ra, na.rm = TRUE) - 1
+      valueBox(
+        value = paste0(round(total_ret * 100, 1), "%"), 
+        subtitle = "Total Return", 
+        icon = icon("arrow-up"), 
+        color = if (total_ret > 0) "green" else "red"
+      )
+    } else {
+      valueBox(value = "Load Data", subtitle = "Total Return", icon = icon("cloud"), color = "light-blue")
+    }
   })
   
   output$sharpe_box <- renderValueBox({
-    valueBox(value = "Ready", subtitle = "Sharpe Ratio", icon = icon("cloud"), color = "light-blue")
+    if (!is.null(values$processed_data)) {
+      # Calculate Sharpe ratio
+      annual_return <- mean(values$processed_data$Ra, na.rm = TRUE) * 252
+      annual_vol <- sd(values$processed_data$Ra, na.rm = TRUE) * sqrt(252)
+      sharpe <- annual_return / annual_vol
+      
+      valueBox(
+        value = round(sharpe, 2), 
+        subtitle = "Sharpe Ratio", 
+        icon = icon("chart-line"), 
+        color = if (sharpe > 1) "blue" else "yellow"
+      )
+    } else {
+      valueBox(value = "Load Data", subtitle = "Sharpe Ratio", icon = icon("cloud"), color = "light-blue")
+    }
   })
   
   output$sortino_box <- renderValueBox({
-    valueBox(value = "Ready", subtitle = "Sortino Ratio", icon = icon("cloud"), color = "light-blue")
+    if (!is.null(values$processed_data)) {
+      # Calculate Sortino ratio
+      annual_return <- mean(values$processed_data$Ra, na.rm = TRUE) * 252
+      negative_returns <- values$processed_data$Ra[values$processed_data$Ra < 0]
+      downside_vol <- sqrt(mean(negative_returns^2, na.rm = TRUE)) * sqrt(252)
+      sortino <- annual_return / downside_vol
+      
+      valueBox(
+        value = round(sortino, 2), 
+        subtitle = "Sortino Ratio", 
+        icon = icon("shield-alt"), 
+        color = "purple"
+      )
+    } else {
+      valueBox(value = "Load Data", subtitle = "Sortino Ratio", icon = icon("cloud"), color = "light-blue")
+    }
   })
   
   output$max_dd_box <- renderValueBox({
-    valueBox(value = "Ready", subtitle = "Max Drawdown", icon = icon("cloud"), color = "light-blue")
+    if (!is.null(values$processed_data)) {
+      # Calculate max drawdown
+      cumulative_returns <- cumprod(1 + values$processed_data$Ra)
+      running_max <- cummax(cumulative_returns)
+      drawdowns <- (cumulative_returns - running_max) / running_max
+      max_dd <- abs(min(drawdowns, na.rm = TRUE))
+      
+      valueBox(
+        value = paste0(round(max_dd * 100, 1), "%"), 
+        subtitle = "Max Drawdown", 
+        icon = icon("arrow-down"), 
+        color = if (max_dd < 0.1) "green" else if (max_dd < 0.2) "yellow" else "red"
+      )
+    } else {
+      valueBox(value = "Load Data", subtitle = "Max Drawdown", icon = icon("cloud"), color = "light-blue")
+    }
   })
   
+  # Performance table
   output$performance_table <- DT::renderDataTable({
-    data.frame(Message = "Load portfolio data to see performance metrics")
-  }, options = list(dom = 't'))
+    if (!is.null(values$processed_data)) {
+      # Create performance metrics table
+      returns <- values$processed_data$Ra
+      
+      # Calculate metrics
+      total_return <- prod(1 + returns, na.rm = TRUE) - 1
+      annual_return <- mean(returns, na.rm = TRUE) * 252
+      annual_vol <- sd(returns, na.rm = TRUE) * sqrt(252)
+      sharpe <- annual_return / annual_vol
+      
+      negative_returns <- returns[returns < 0]
+      downside_vol <- sqrt(mean(negative_returns^2, na.rm = TRUE)) * sqrt(252)
+      sortino <- annual_return / downside_vol
+      
+      cumulative_returns <- cumprod(1 + returns)
+      running_max <- cummax(cumulative_returns)
+      drawdowns <- (cumulative_returns - running_max) / running_max
+      max_dd <- abs(min(drawdowns, na.rm = TRUE))
+      
+      win_rate <- sum(returns > 0, na.rm = TRUE) / length(returns[!is.na(returns)])
+      
+      performance_table <- data.frame(
+        Metric = c("Total Return", "Annualized Return", "Annualized Volatility", 
+                   "Sharpe Ratio", "Sortino Ratio", "Max Drawdown", "Win Rate"),
+        Value = c(
+          sprintf("%.1f%%", total_return * 100),
+          sprintf("%.1f%%", annual_return * 100),
+          sprintf("%.1f%%", annual_vol * 100),
+          sprintf("%.2f", sharpe),
+          sprintf("%.2f", sortino),
+          sprintf("%.1f%%", max_dd * 100),
+          sprintf("%.1f%%", win_rate * 100)
+        ),
+        stringsAsFactors = FALSE
+      )
+      
+      DT::datatable(performance_table, options = list(pageLength = 25, dom = 'ft'), rownames = FALSE)
+    } else {
+      DT::datatable(
+        data.frame(Message = "Load portfolio data to see performance metrics"),
+        options = list(dom = 't'), rownames = FALSE
+      )
+    }
+  })
   
+  # Strategy grade
   output$strategy_grade <- renderUI({
-    div(class = "alert alert-info", h4("Load data to see strategy grade"))
+    if (!is.null(values$processed_data)) {
+      # Simple grading based on Sharpe ratio
+      returns <- values$processed_data$Ra
+      annual_return <- mean(returns, na.rm = TRUE) * 252
+      annual_vol <- sd(returns, na.rm = TRUE) * sqrt(252)
+      sharpe <- annual_return / annual_vol
+      
+      grade <- if (sharpe > 2) "A+" else if (sharpe > 1.5) "A" else if (sharpe > 1) "B+" else if (sharpe > 0.5) "B" else "C"
+      grade_color <- if (grade %in% c("A+", "A")) "success" else if (grade %in% c("B+", "B")) "primary" else "warning"
+      
+      div(
+        div(class = paste("alert alert-", grade_color),
+            h3(paste("Grade:", grade)),
+            p(paste("Sharpe Ratio:", round(sharpe, 2)))
+        )
+      )
+    } else {
+      div(class = "alert alert-info", h4("Load data to see strategy grade"))
+    }
   })
 }
 
