@@ -1,4 +1,4 @@
-## ============================================================================
+# ============================================================================
 # CLOUD-READY PORTFOLIO ANALYTICS SHINY APP
 # Optimized for Posit Cloud Connect deployment
 # ============================================================================
@@ -45,42 +45,45 @@ if (file.exists("supporting_functions.R")) {
 # CLOUD-OPTIMIZED AWS HELPER FUNCTIONS
 # ============================================================================
 
-# Auto-load AWS credentials (cloud-optimized)
+# Auto-load AWS credentials (Posit Connect Cloud pattern)
 auto_load_aws_credentials <- function() {
-  # Priority 1: Environment variables (works in all cloud environments)
-  if (Sys.getenv("AWS_ACCESS_KEY_ID") != "" && Sys.getenv("AWS_SECRET_ACCESS_KEY") != "") {
+  # Posit Connect Cloud: Environment variables are available immediately
+  # No need for delays - they're injected before app starts
+  
+  # Check for all required AWS environment variables
+  aws_access_key <- Sys.getenv("AWS_ACCESS_KEY_ID", unset = "")
+  aws_secret_key <- Sys.getenv("AWS_SECRET_ACCESS_KEY", unset = "")
+  aws_region <- Sys.getenv("AWS_DEFAULT_REGION", unset = "us-east-1")
+  aws_bucket <- Sys.getenv("AWS_S3_BUCKET", unset = "")
+  
+  # Debug: Print what we found (safely)
+  cat("Debug - Environment variable check:\n")
+  cat("AWS_ACCESS_KEY_ID found:", aws_access_key != "", "\n")
+  cat("AWS_SECRET_ACCESS_KEY found:", aws_secret_key != "", "\n") 
+  cat("AWS_DEFAULT_REGION:", aws_region, "\n")
+  cat("AWS_S3_BUCKET:", aws_bucket, "\n")
+  
+  # Only return credentials if we have the minimum required
+  if (aws_access_key != "" && aws_secret_key != "") {
+    cat("✅ Found AWS credentials in environment variables\n")
     return(list(
-      access_key = Sys.getenv("AWS_ACCESS_KEY_ID"),
-      secret_key = Sys.getenv("AWS_SECRET_ACCESS_KEY"),
-      region = Sys.getenv("AWS_DEFAULT_REGION", "us-east-1"),
-      bucket = Sys.getenv("AWS_S3_BUCKET", ""),
-      source = "environment"
+      access_key = aws_access_key,
+      secret_key = aws_secret_key,
+      region = aws_region,
+      bucket = aws_bucket,
+      source = "Posit Connect environment"
     ))
+  } else {
+    cat("❌ AWS credentials not found in environment variables\n")
+    
+    # Additional debug: Check if we're in Connect Cloud
+    if (Sys.getenv("CONNECT_SERVER", unset = "") != "") {
+      cat("Running in Posit Connect, but credentials not available\n")
+      cat("Check that secret variables are set in the Connect dashboard\n")
+    }
+    
+    return(NULL)
   }
-  
-  # Priority 2: Local files (only when not deployed)
-  if (Sys.getenv("CONNECT_SERVER") == "" && Sys.getenv("SHINY_SERVER_VERSION") == "") {
-    # Try local .Renviron file
-    tryCatch({
-      renviron_file <- file.path(Sys.getenv("HOME"), ".Renviron")
-      if (file.exists(renviron_file)) {
-        readRenviron(renviron_file)
-        if (Sys.getenv("AWS_ACCESS_KEY_ID") != "" && Sys.getenv("AWS_SECRET_ACCESS_KEY") != "") {
-          return(list(
-            access_key = Sys.getenv("AWS_ACCESS_KEY_ID"),
-            secret_key = Sys.getenv("AWS_SECRET_ACCESS_KEY"),
-            region = Sys.getenv("AWS_DEFAULT_REGION", "us-east-1"),
-            bucket = Sys.getenv("AWS_S3_BUCKET", ""),
-            source = ".Renviron (local)"
-          ))
-        }
-      }
-    }, error = function(e) {
-      # Ignore file read errors in cloud environments
-    })
-  }
-  
-  return(NULL)
 }
 
 # Configure AWS credentials
@@ -347,15 +350,16 @@ ui <- dashboardPage(
                                         padding: 20px; border-radius: 8px; margin-bottom: 20px;",
                                h4("🔑 Credentials", style = "margin-top: 0; color: #495057;"),
                                
-                               # Cloud deployment notice
-                               conditionalPanel(
-                                 condition = "true", # Always show
-                                 div(
-                                   style = "background: #d1ecf1; padding: 10px; border-radius: 4px; margin-bottom: 15px; border-left: 4px solid #17a2b8;",
-                                   div(style = "font-size: 0.9em; color: #0c5460;",
-                                       strong("🌐 Cloud Deployment"), br(),
-                                       "For production, set environment variables: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_S3_BUCKET")
-                                 )
+                               # Posit Connect Cloud notice - updated
+                               div(
+                                 style = "background: #d1ecf1; padding: 10px; border-radius: 4px; margin-bottom: 15px; border-left: 4px solid #17a2b8;",
+                                 div(style = "font-size: 0.9em; color: #0c5460;",
+                                     strong("🌐 Posit Connect Cloud"), br(),
+                                     "Set these as secret variables in your app settings:", br(),
+                                     tags$code("AWS_ACCESS_KEY_ID"), ", ",
+                                     tags$code("AWS_SECRET_ACCESS_KEY"), ", ",
+                                     tags$code("AWS_S3_BUCKET"), ", ",
+                                     tags$code("AWS_DEFAULT_REGION"))
                                ),
                                
                                textInput("aws_access_key", 
@@ -541,68 +545,65 @@ server <- function(input, output, session) {
     }
   })
   
-  # Auto-load credentials with better cloud detection
+  # Auto-load credentials - simplified approach like Posit Connect example
   observe({
-    # Add delay for cloud environment to initialize
-    if (Sys.getenv("CONNECT_SERVER") != "") {
-      # In Posit Connect, add small delay for environment variables to be available
-      Sys.sleep(0.5)
-    }
+    cat("=== AUTO-LOADING CREDENTIALS ===\n")
     
     auto_creds <- auto_load_aws_credentials()
     
     if (!is.null(auto_creds)) {
-      # Pre-populate form fields
+      cat("Successfully loaded credentials from:", auto_creds$source, "\n")
+      
+      # Update form fields
       updateTextInput(session, "aws_access_key", value = auto_creds$access_key)
       updateTextInput(session, "aws_secret_key", value = auto_creds$secret_key)
       updateSelectInput(session, "aws_region", selected = auto_creds$region)
       updateTextInput(session, "s3_bucket", value = auto_creds$bucket)
       
+      # Update processing log with detailed info
       values$processing_log <- paste0(
-        "✅ Auto-loaded credentials from ", auto_creds$source, "\n",
+        "✅ Auto-loaded from ", auto_creds$source, "\n",
         "🔑 Access Key: ", substr(auto_creds$access_key, 1, 8), "...\n",
         "🌍 Region: ", auto_creds$region, "\n",
-        "🪣 Bucket: ", auto_creds$bucket
+        "🪣 Bucket: ", auto_creds$bucket, "\n\n",
+        if (auto_creds$bucket != "") "✅ Ready to test connection!" else "⚠️ Set bucket name and test connection"
       )
       
-      # Auto-test connection if we have all required info
-      if (auto_creds$bucket != "" && auto_creds$access_key != "") {
-        values$processing_log <- paste(values$processing_log, "\n🔄 Auto-testing connection...")
-        
-        # Auto-trigger connection test after short delay
-        if (requireNamespace("shinyjs", quietly = TRUE)) {
-          shinyjs::delay(1000, {
-            if (input$s3_bucket != "" && input$aws_access_key != "") {
-              shinyjs::click("test_connection")
-            }
-          })
-        } else {
-          # Fallback without shinyjs
-          values$processing_log <- paste(values$processing_log, "\n✅ Ready - click 'Test Connection'")
-        }
-      }
-      
-      # Update connection status immediately
+      # Update connection status
       output$connection_status <- renderText({
         paste0("🤖 Credentials loaded from ", auto_creds$source, "\n",
-               "Ready to test connection...")
+               "Access Key: ", substr(auto_creds$access_key, 1, 8), "...\n",
+               "Region: ", auto_creds$region, "\n",
+               "Bucket: ", auto_creds$bucket, "\n",
+               "Status: Ready to test connection")
       })
+      
     } else {
-      # No auto-credentials found
+      cat("No credentials found in environment\n")
+      
+      # Show helpful debug info
       values$processing_log <- paste0(
-        "⚠️ No environment variables found\n",
-        "Please enter credentials manually\n\n",
-        "Expected variables:\n",
-        "- AWS_ACCESS_KEY_ID\n", 
-        "- AWS_SECRET_ACCESS_KEY\n",
-        "- AWS_S3_BUCKET\n",
-        "- AWS_DEFAULT_REGION"
+        "❌ No AWS credentials found\n\n",
+        "Expected environment variables:\n",
+        "• AWS_ACCESS_KEY_ID\n", 
+        "• AWS_SECRET_ACCESS_KEY\n",
+        "• AWS_S3_BUCKET\n",
+        "• AWS_DEFAULT_REGION\n\n",
+        "In Posit Connect:\n",
+        "1. Go to app settings\n",
+        "2. Set secret variables\n",
+        "3. Redeploy app\n\n",
+        "Environment check:\n",
+        "• CONNECT_SERVER: ", Sys.getenv("CONNECT_SERVER", "(not set)"), "\n",
+        "• Running in cloud: ", Sys.getenv("CONNECT_SERVER") != ""
       )
       
       output$connection_status <- renderText({
-        "📝 Please enter AWS credentials manually"
+        "📝 Please enter AWS credentials manually or check environment variables"
       })
     }
+    
+    cat("=== END AUTO-LOADING ===\n")
   })
   
   # Test connection with better error handling and feedback
