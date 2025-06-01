@@ -1123,22 +1123,8 @@ server <- function(input, output, session) {
         
         incProgress(0.8, detail = "Running portfolio analysis...")
         
-        # Run analysis (basic version for now)
-        strategy_name <- paste0(tools::file_path_sans_ext(selected_file$display_name),
-                                if (input$rescale_volatility_s3) " (10% Vol)" else "")
-        
-        # For now, create basic analysis results structure
-        analysis_results <- list(
-          summary_stats = data.frame(
-            Metric = c("Total Return", "Sharpe Ratio", "Max Drawdown", "Annual Volatility"),
-            Value = c("Processing...", "Processing...", "Processing...", "Processing..."),
-            stringsAsFactors = FALSE
-          ),
-          raw_data = list(
-            portfolio_returns = NULL
-          )
-        )
-        
+        # Run full analysis using the original hf_grade_analysis function
+        analysis_results <- hf_grade_analysis(processed_data, fund_name = strategy_name)
         values$analysis_results <- analysis_results
         
         incProgress(1.0, detail = "Complete!")
@@ -1171,7 +1157,314 @@ server <- function(input, output, session) {
     })
   })
   
-  # Process portfolio data function
+  # COMPLETE HEDGE FUND GRADE ANALYSIS FUNCTION
+  hf_grade_analysis <- function(portfolio_data, benchmark_data = NULL, fund_name = "Portfolio") {
+    
+    # Convert to xts format for PerformanceAnalytics
+    dates <- portfolio_data$date
+    portfolio_returns <- xts(portfolio_data$Ra, order.by = dates)
+    
+    # Get SPY benchmark if not provided
+    if (is.null(benchmark_data) && "Rb" %in% names(portfolio_data)) {
+      benchmark_returns <- xts(portfolio_data$Rb, order.by = dates)
+    } else {
+      # Fetch SPY data
+      min_date <- min(dates, na.rm = TRUE) - 1
+      max_date <- max(dates, na.rm = TRUE)
+      
+      tryCatch({
+        spy <- tq_get("SPY", from = min_date, to = max_date) %>% 
+          tq_transmute(select = adjusted, mutate_fun = periodReturn, 
+                       period = "daily", col_rename = "Rb") %>% 
+          filter(row_number() > 1)
+        benchmark_returns <- xts(spy$Rb, order.by = spy$date)
+      }, error = function(e) {
+        cat("Could not fetch SPY data:", e$message, "\n")
+        benchmark_returns <- NULL
+      })
+    }
+    
+    # CORE PERFORMANCE METRICS
+    total_return <- Return.cumulative(portfolio_returns)
+    annualized_return <- Return.annualized(portfolio_returns)
+    annualized_vol <- StdDev.annualized(portfolio_returns)
+    sharpe_ratio <- SharpeRatio.annualized(portfolio_returns, Rf = 0)
+    
+    # Manual Sortino calculation (PA version is broken)
+    returns_vector <- as.numeric(portfolio_returns)
+    negative_returns <- returns_vector[returns_vector < 0 & !is.na(returns_vector)]
+    downside_deviation <- sqrt(mean(negative_returns^2, na.rm = TRUE)) * sqrt(252)
+    sortino_ratio <- (mean(returns_vector, na.rm = TRUE) * 252) / downside_deviation
+    
+    max_drawdown <- maxDrawdown(portfolio_returns)
+    
+    # Higher moments
+    skewness_val <- skewness(portfolio_returns, na.rm = TRUE)
+    kurtosis_val <- kurtosis(portfolio_returns, na.rm = TRUE)
+    
+    # VaR and ES metrics
+    var_95 <- VaR(portfolio_returns, p = 0.95, method = "historical")
+    var_99 <- VaR(portfolio_returns, p = 0.99, method = "historical")
+    es_95 <- ES(portfolio_returns, p = 0.95, method = "historical")
+    es_99 <- ES(portfolio_returns, p = 0.99, method = "historical")
+    
+    # Calmar ratio
+    calmar_ratio <- CalmarRatio(portfolio_returns)
+    
+    # Market metrics (if benchmark available)
+    if (!is.null(benchmark_returns)) {
+      beta_val <- CAPM.beta(portfolio_returns, benchmark_returns)
+      
+      # Manual alpha calculation
+      portfolio_vec <- as.numeric(portfolio_returns)
+      benchmark_vec <- as.numeric(benchmark_returns)
+      paired_data <- na.omit(data.frame(portfolio = portfolio_vec, benchmark = benchmark_vec))
+      
+      if (nrow(paired_data) > 10) {
+        beta_manual <- cov(paired_data$portfolio, paired_data$benchmark) / var(paired_data$benchmark)
+        portfolio_annual <- mean(paired_data$portfolio) * 252
+        benchmark_annual <- mean(paired_data$benchmark) * 252
+        alpha_val <- portfolio_annual - beta_manual * benchmark_annual
+      } else {
+        alpha_val <- 0
+      }
+      
+      info_ratio <- InformationRatio(portfolio_returns, benchmark_returns)
+      tracking_error <- TrackingError(portfolio_returns, benchmark_returns)
+      
+      updown_ratios <- UpDownRatios(portfolio_returns, benchmark_returns)
+      up_capture <- updown_ratios[1,1]
+      down_capture <- updown_ratios[2,1]
+    }
+    
+    # Monthly returns for analysis
+    monthly_returns <- portfolio_returns %>%
+      fortify(melt = TRUE) %>%
+      mutate(date = as.Date(Index),
+             year = year(date),
+             month = month(date)) %>%
+      group_by(year, month) %>%
+      summarise(monthly_ret = prod(1 + Value) - 1, .groups = 'drop')
+    
+    # Drawdown analysis
+    dd_table <- table.Drawdowns(portfolio_returns, top = 10)
+    
+    # Best/Worst periods
+    returns_vector <- as.numeric(portfolio_returns)
+    best_day <- max(returns_vector, na.rm = TRUE)
+    worst_day <- min(returns_vector, na.rm = TRUE)
+    best_month <- max(monthly_returns$monthly_ret, na.rm = TRUE)
+    worst_month <- min(monthly_returns$monthly_ret, na.rm = TRUE)
+    
+    # Win rate
+    win_rate <- sum(returns_vector > 0, na.rm = TRUE) / length(returns_vector[!is.na(returns_vector)])
+    
+    # Consecutive analysis
+    runs <- rle(sign(returns_vector))
+    pos_runs <- runs$lengths[runs$values > 0]
+    neg_runs <- runs$lengths[runs$values < 0]
+    
+    max_consecutive_wins <- if(length(pos_runs) > 0) max(pos_runs) else 0
+    max_consecutive_losses <- if(length(neg_runs) > 0) max(neg_runs) else 0
+    
+    # Summary statistics table
+    summary_stats <- data.frame(
+      Metric = c("Total Return", "Annualized Return", "Annualized Volatility", 
+                 "Sharpe Ratio", "Sortino Ratio", "Calmar Ratio", "Max Drawdown",
+                 "VaR (95%)", "VaR (99%)", "Expected Shortfall (95%)", "Expected Shortfall (99%)",
+                 "Skewness", "Excess Kurtosis", "Win Rate", "Best Day", "Worst Day",
+                 "Max Consecutive Wins", "Max Consecutive Losses"),
+      Value = c(sprintf("%.2f%%", total_return * 100),
+                sprintf("%.2f%%", annualized_return * 100),
+                sprintf("%.2f%%", annualized_vol * 100),
+                sprintf("%.2f", sharpe_ratio),
+                sprintf("%.2f", sortino_ratio),
+                sprintf("%.2f", calmar_ratio),
+                sprintf("%.2f%%", abs(max_drawdown) * 100),
+                sprintf("%.2f%%", abs(var_95) * 100),
+                sprintf("%.2f%%", abs(var_99) * 100),
+                sprintf("%.2f%%", abs(es_95) * 100),
+                sprintf("%.2f%%", abs(es_99) * 100),
+                sprintf("%.3f", skewness_val),
+                sprintf("%.3f", kurtosis_val),
+                sprintf("%.1f%%", win_rate * 100),
+                sprintf("%.2f%%", best_day * 100),
+                sprintf("%.2f%%", worst_day * 100),
+                sprintf("%d", max_consecutive_wins),
+                sprintf("%d", max_consecutive_losses))
+    )
+    
+    # Add benchmark metrics if available
+    if (!is.null(benchmark_returns)) {
+      benchmark_metrics <- data.frame(
+        Metric = c("Beta", "Alpha (Annualized)", "Information Ratio", "Tracking Error",
+                   "Up Capture", "Down Capture"),
+        Value = c(sprintf("%.2f", beta_val),
+                  sprintf("%.2f%%", alpha_val * 100),
+                  sprintf("%.2f", info_ratio),
+                  sprintf("%.2f%%", tracking_error * 100),
+                  sprintf("%.1f%%", up_capture * 100),
+                  sprintf("%.1f%%", down_capture * 100))
+      )
+      summary_stats <- rbind(summary_stats, benchmark_metrics)
+    }
+    
+    # VISUALIZATIONS
+    # Cumulative returns plot
+    cumulative_data <- data.frame(
+      date = index(portfolio_returns),
+      portfolio = as.numeric(cumprod(1 + portfolio_returns))
+    )
+    
+    if (!is.null(benchmark_returns)) {
+      cumulative_data$benchmark <- as.numeric(cumprod(1 + benchmark_returns))
+    }
+    
+    p1 <- ggplot(cumulative_data, aes(x = date)) +
+      geom_line(aes(y = portfolio), color = "blue", linewidth = 1) +
+      {if(!is.null(benchmark_returns)) geom_line(aes(y = benchmark), color = "red", alpha = 0.7)} +
+      scale_y_log10(labels = scales::percent_format(accuracy = 1)) +
+      labs(title = paste(fund_name, "- Cumulative Returns"), 
+           x = "Date", y = "Cumulative Return (Log Scale)") +
+      theme_minimal()
+    
+    # Drawdown plot
+    drawdown_data <- data.frame(
+      date = index(portfolio_returns),
+      drawdown = as.numeric(Drawdowns(portfolio_returns))
+    )
+    
+    p2 <- ggplot(drawdown_data, aes(x = date, y = drawdown)) +
+      geom_area(fill = "red", alpha = 0.3) +
+      geom_line(color = "red") +
+      scale_y_continuous(labels = percent_format()) +
+      labs(title = paste(fund_name, "- Underwater Chart"), 
+           x = "Date", y = "Drawdown") +
+      theme_minimal()
+    
+    # Rolling Sharpe ratio plot
+    rolling_sharpe <- rollapply(portfolio_returns, width = 252, 
+                                FUN = function(x) mean(x)/sd(x) * sqrt(252), 
+                                fill = NA, align = "right")
+    
+    rolling_data <- data.frame(
+      date = index(portfolio_returns),
+      rolling_sharpe = as.numeric(rolling_sharpe)
+    ) %>% filter(!is.na(rolling_sharpe))
+    
+    p3 <- ggplot(rolling_data, aes(x = date, y = rolling_sharpe)) +
+      geom_line(color = "blue") +
+      geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) +
+      labs(title = paste(fund_name, "- Rolling 12-Month Sharpe Ratio"), 
+           x = "Date", y = "Sharpe Ratio") +
+      theme_minimal()
+    
+    # Return distribution
+    p4 <- ggplot(data.frame(returns = as.numeric(portfolio_returns)), aes(x = returns)) +
+      geom_histogram(bins = 50, fill = "blue", alpha = 0.7) +
+      geom_vline(xintercept = mean(as.numeric(portfolio_returns), na.rm = TRUE), 
+                 color = "red", linetype = "dashed") +
+      scale_x_continuous(labels = percent_format()) +
+      labs(title = paste(fund_name, "- Return Distribution"), 
+           x = "Daily Returns", y = "Frequency") +
+      theme_minimal()
+    
+    # Return results
+    return(list(
+      summary_stats = summary_stats,
+      plots = list(
+        cumulative_returns = p1,
+        drawdowns = p2,
+        rolling_sharpe = p3,
+        return_distribution = p4
+      ),
+      raw_data = list(
+        portfolio_returns = portfolio_returns,
+        benchmark_returns = benchmark_returns,
+        dates = dates
+      ),
+      drawdown_table = dd_table,
+      monthly_returns = monthly_returns
+    ))
+  }
+  
+  # ORIGINAL GRADING FUNCTION
+  grade_strategy <- function(analysis_results) {
+    
+    summary_stats <- analysis_results$summary_stats
+    
+    # Extract key metrics - handle percentage strings properly
+    total_return_str <- summary_stats$Value[summary_stats$Metric == "Total Return"]
+    total_return <- as.numeric(gsub("%", "", total_return_str)) / 100
+    
+    sharpe <- as.numeric(summary_stats$Value[summary_stats$Metric == "Sharpe Ratio"])
+    
+    max_dd_str <- summary_stats$Value[summary_stats$Metric == "Max Drawdown"]
+    max_dd <- as.numeric(gsub("%", "", max_dd_str)) / 100
+    
+    volatility_str <- summary_stats$Value[summary_stats$Metric == "Annualized Volatility"]
+    volatility <- as.numeric(gsub("%", "", volatility_str)) / 100
+    
+    # Grading criteria - ORIGINAL THRESHOLDS
+    grade_points <- 0
+    
+    # Return component (0-30 points)
+    if (total_return > 5.0) grade_points <- grade_points + 30        # 500%+ 
+    else if (total_return > 2.0) grade_points <- grade_points + 28   # 200%+
+    else if (total_return > 1.0) grade_points <- grade_points + 25   # 100%+
+    else if (total_return > 0.5) grade_points <- grade_points + 20   # 50%+
+    else if (total_return > 0.2) grade_points <- grade_points + 15   # 20%+
+    else if (total_return > 0.1) grade_points <- grade_points + 10   # 10%+
+    else grade_points <- grade_points + 5
+    
+    # Sharpe component (0-25 points)
+    if (sharpe > 2.0) grade_points <- grade_points + 25
+    else if (sharpe > 1.5) grade_points <- grade_points + 23
+    else if (sharpe > 1.3) grade_points <- grade_points + 20
+    else if (sharpe > 1.0) grade_points <- grade_points + 17
+    else if (sharpe > 0.8) grade_points <- grade_points + 12
+    else if (sharpe > 0.5) grade_points <- grade_points + 8
+    else grade_points <- grade_points + 3
+    
+    # Drawdown component (0-25 points)
+    if (max_dd < 0.05) grade_points <- grade_points + 25
+    else if (max_dd < 0.10) grade_points <- grade_points + 20
+    else if (max_dd < 0.15) grade_points <- grade_points + 17
+    else if (max_dd < 0.20) grade_points <- grade_points + 14
+    else if (max_dd < 0.30) grade_points <- grade_points + 10
+    else grade_points <- grade_points + 5
+    
+    # Volatility component (0-20 points)
+    if (volatility <= 0.10) grade_points <- grade_points + 20
+    else if (volatility <= 0.15) grade_points <- grade_points + 17
+    else if (volatility <= 0.20) grade_points <- grade_points + 14
+    else if (volatility <= 0.30) grade_points <- grade_points + 10
+    else if (volatility <= 0.50) grade_points <- grade_points + 5
+    else grade_points <- grade_points + 2
+    
+    # Convert to letter grade
+    if (grade_points >= 90) grade <- "A+"
+    else if (grade_points >= 85) grade <- "A"
+    else if (grade_points >= 80) grade <- "A-"
+    else if (grade_points >= 75) grade <- "B+"
+    else if (grade_points >= 70) grade <- "B"
+    else if (grade_points >= 65) grade <- "B-"
+    else if (grade_points >= 60) grade <- "C+"
+    else if (grade_points >= 55) grade <- "C"
+    else if (grade_points >= 50) grade <- "C-"
+    else grade <- "F"
+    
+    return(list(
+      grade = grade,
+      points = grade_points,
+      breakdown = list(
+        return_points = if (total_return > 2.0) 28 else 25,
+        sharpe_points = if (sharpe > 1.3) 20 else 17,
+        drawdown_points = if (max_dd < 0.10) 20 else 17,
+        volatility_points = if (volatility <= 0.10) 20 else 17
+      )
+    ))
+  }
   process_portfolio_data <- function(data, rescale_vol = FALSE) {
     cat("Processing portfolio data...\n")
     
@@ -1240,145 +1533,101 @@ server <- function(input, output, session) {
       stop("Data format not recognized. Expected columns: ticker, daily_return, date, [weights]")
     }
   }
-  # Value boxes - updated to show processed data
+  # Value boxes - using original analysis results
   output$total_return_box <- renderValueBox({
-    if (!is.null(values$analysis_results) && !is.null(values$processed_data)) {
-      # Calculate total return from processed data
-      total_ret <- prod(1 + values$processed_data$Ra, na.rm = TRUE) - 1
-      valueBox(
-        value = paste0(round(total_ret * 100, 1), "%"), 
-        subtitle = "Total Return", 
-        icon = icon("arrow-up"), 
-        color = if (total_ret > 0) "green" else "red"
-      )
+    if (!is.null(values$analysis_results)) {
+      total_ret <- values$analysis_results$summary_stats$Value[
+        values$analysis_results$summary_stats$Metric == "Total Return"]
+      valueBox(value = total_ret, subtitle = "Total Return", icon = icon("arrow-up"), color = "green")
     } else {
       valueBox(value = "Load Data", subtitle = "Total Return", icon = icon("cloud"), color = "light-blue")
     }
   })
   
   output$sharpe_box <- renderValueBox({
-    if (!is.null(values$processed_data)) {
-      # Calculate Sharpe ratio
-      annual_return <- mean(values$processed_data$Ra, na.rm = TRUE) * 252
-      annual_vol <- sd(values$processed_data$Ra, na.rm = TRUE) * sqrt(252)
-      sharpe <- annual_return / annual_vol
-      
-      valueBox(
-        value = round(sharpe, 2), 
-        subtitle = "Sharpe Ratio", 
-        icon = icon("chart-line"), 
-        color = if (sharpe > 1) "blue" else "yellow"
-      )
+    if (!is.null(values$analysis_results)) {
+      sharpe <- values$analysis_results$summary_stats$Value[
+        values$analysis_results$summary_stats$Metric == "Sharpe Ratio"]
+      color <- if (as.numeric(sharpe) > 1) "blue" else "yellow"
+      valueBox(value = sharpe, subtitle = "Sharpe Ratio", icon = icon("chart-line"), color = color)
     } else {
       valueBox(value = "Load Data", subtitle = "Sharpe Ratio", icon = icon("cloud"), color = "light-blue")
     }
   })
   
   output$sortino_box <- renderValueBox({
-    if (!is.null(values$processed_data)) {
-      # Calculate Sortino ratio
-      annual_return <- mean(values$processed_data$Ra, na.rm = TRUE) * 252
-      negative_returns <- values$processed_data$Ra[values$processed_data$Ra < 0]
-      downside_vol <- sqrt(mean(negative_returns^2, na.rm = TRUE)) * sqrt(252)
-      sortino <- annual_return / downside_vol
-      
-      valueBox(
-        value = round(sortino, 2), 
-        subtitle = "Sortino Ratio", 
-        icon = icon("shield-alt"), 
-        color = "purple"
-      )
+    if (!is.null(values$analysis_results)) {
+      sortino <- values$analysis_results$summary_stats$Value[
+        values$analysis_results$summary_stats$Metric == "Sortino Ratio"]
+      valueBox(value = sortino, subtitle = "Sortino Ratio (Fixed)", icon = icon("shield-alt"), color = "purple")
     } else {
       valueBox(value = "Load Data", subtitle = "Sortino Ratio", icon = icon("cloud"), color = "light-blue")
     }
   })
   
   output$max_dd_box <- renderValueBox({
-    if (!is.null(values$processed_data)) {
-      # Calculate max drawdown
-      cumulative_returns <- cumprod(1 + values$processed_data$Ra)
-      running_max <- cummax(cumulative_returns)
-      drawdowns <- (cumulative_returns - running_max) / running_max
-      max_dd <- abs(min(drawdowns, na.rm = TRUE))
-      
-      valueBox(
-        value = paste0(round(max_dd * 100, 1), "%"), 
-        subtitle = "Max Drawdown", 
-        icon = icon("arrow-down"), 
-        color = if (max_dd < 0.1) "green" else if (max_dd < 0.2) "yellow" else "red"
-      )
+    if (!is.null(values$analysis_results)) {
+      max_dd <- values$analysis_results$summary_stats$Value[
+        values$analysis_results$summary_stats$Metric == "Max Drawdown"]
+      dd_numeric <- as.numeric(gsub("%", "", max_dd))
+      color <- if (dd_numeric < 10) "green" else if (dd_numeric < 20) "yellow" else "red"
+      valueBox(value = max_dd, subtitle = "Max Drawdown", icon = icon("arrow-down"), color = color)
     } else {
       valueBox(value = "Load Data", subtitle = "Max Drawdown", icon = icon("cloud"), color = "light-blue")
     }
   })
   
-  # Performance table
+  # Performance table - using original analysis results
   output$performance_table <- DT::renderDataTable({
-    if (!is.null(values$processed_data)) {
-      # Create performance metrics table
-      returns <- values$processed_data$Ra
-      
-      # Calculate metrics
-      total_return <- prod(1 + returns, na.rm = TRUE) - 1
-      annual_return <- mean(returns, na.rm = TRUE) * 252
-      annual_vol <- sd(returns, na.rm = TRUE) * sqrt(252)
-      sharpe <- annual_return / annual_vol
-      
-      negative_returns <- returns[returns < 0]
-      downside_vol <- sqrt(mean(negative_returns^2, na.rm = TRUE)) * sqrt(252)
-      sortino <- annual_return / downside_vol
-      
-      cumulative_returns <- cumprod(1 + returns)
-      running_max <- cummax(cumulative_returns)
-      drawdowns <- (cumulative_returns - running_max) / running_max
-      max_dd <- abs(min(drawdowns, na.rm = TRUE))
-      
-      win_rate <- sum(returns > 0, na.rm = TRUE) / length(returns[!is.na(returns)])
-      
-      performance_table <- data.frame(
-        Metric = c("Total Return", "Annualized Return", "Annualized Volatility", 
-                   "Sharpe Ratio", "Sortino Ratio", "Max Drawdown", "Win Rate"),
-        Value = c(
-          sprintf("%.1f%%", total_return * 100),
-          sprintf("%.1f%%", annual_return * 100),
-          sprintf("%.1f%%", annual_vol * 100),
-          sprintf("%.2f", sharpe),
-          sprintf("%.2f", sortino),
-          sprintf("%.1f%%", max_dd * 100),
-          sprintf("%.1f%%", win_rate * 100)
-        ),
-        stringsAsFactors = FALSE
-      )
-      
-      DT::datatable(performance_table, options = list(pageLength = 25, dom = 'ft'), rownames = FALSE)
+    if (!is.null(values$analysis_results)) {
+      values$analysis_results$summary_stats
     } else {
       DT::datatable(
         data.frame(Message = "Load portfolio data to see performance metrics"),
         options = list(dom = 't'), rownames = FALSE
       )
     }
-  })
+  }, options = list(pageLength = 25, dom = 'ft'), rownames = FALSE)
   
-  # Strategy grade
+  # Strategy grade - using original grading function
   output$strategy_grade <- renderUI({
-    if (!is.null(values$processed_data)) {
-      # Simple grading based on Sharpe ratio
-      returns <- values$processed_data$Ra
-      annual_return <- mean(returns, na.rm = TRUE) * 252
-      annual_vol <- sd(returns, na.rm = TRUE) * sqrt(252)
-      sharpe <- annual_return / annual_vol
+    if (!is.null(values$analysis_results)) {
+      grade_result <- grade_strategy(values$analysis_results)
       
-      grade <- if (sharpe > 2) "A+" else if (sharpe > 1.5) "A" else if (sharpe > 1) "B+" else if (sharpe > 0.5) "B" else "C"
-      grade_color <- if (grade %in% c("A+", "A")) "success" else if (grade %in% c("B+", "B")) "primary" else "warning"
+      grade_color <- case_when(
+        grade_result$grade %in% c("A+", "A") ~ "success",
+        grade_result$grade %in% c("A-", "B+", "B") ~ "primary", 
+        grade_result$grade %in% c("B-", "C+", "C") ~ "warning",
+        TRUE ~ "danger"
+      )
       
       div(
         div(class = paste("alert alert-", grade_color),
-            h3(paste("Grade:", grade)),
-            p(paste("Sharpe Ratio:", round(sharpe, 2)))
+            h3(paste("Grade:", grade_result$grade)),
+            p(paste("Score:", grade_result$points, "/100"))
         )
       )
     } else {
       div(class = "alert alert-info", h4("Load data to see strategy grade"))
+    }
+  })
+  
+  # Charts - using original analysis results
+  output$cumulative_plot <- renderPlotly({
+    if (!is.null(values$analysis_results)) {
+      ggplotly(values$analysis_results$plots$cumulative_returns)
+    }
+  })
+  
+  output$drawdown_plot <- renderPlotly({
+    if (!is.null(values$analysis_results)) {
+      ggplotly(values$analysis_results$plots$drawdowns)
+    }
+  })
+  
+  output$return_dist_plot <- renderPlotly({
+    if (!is.null(values$analysis_results)) {
+      ggplotly(values$analysis_results$plots$return_distribution)
     }
   })
 }
