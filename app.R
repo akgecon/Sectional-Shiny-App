@@ -1,4 +1,4 @@
-# ============================================================================
+## ============================================================================
 # CLOUD-READY PORTFOLIO ANALYTICS SHINY APP
 # Optimized for Posit Cloud Connect deployment
 # ============================================================================
@@ -19,6 +19,10 @@ suppressPackageStartupMessages({
   library(aws.signature)
   library(httr)
   library(readxl)
+  # Add shinyjs for delay functionality
+  if (requireNamespace("shinyjs", quietly = TRUE)) {
+    library(shinyjs)
+  }
 })
 
 # Cloud deployment: SSL certificates work properly, no need for workarounds
@@ -288,6 +292,9 @@ ui <- dashboardPage(
   ),
   
   dashboardBody(
+    # Enable shinyjs if available for delay functionality
+    if (requireNamespace("shinyjs", quietly = TRUE)) shinyjs::useShinyjs(),
+    
     tags$head(
       tags$style(HTML("
         .main-header .navbar { background: linear-gradient(135deg, #2c3e50 0%, #34495e 100%) !important; }
@@ -534,43 +541,131 @@ server <- function(input, output, session) {
     }
   })
   
-  # Auto-load credentials
+  # Auto-load credentials with better cloud detection
   observe({
+    # Add delay for cloud environment to initialize
+    if (Sys.getenv("CONNECT_SERVER") != "") {
+      # In Posit Connect, add small delay for environment variables to be available
+      Sys.sleep(0.5)
+    }
+    
     auto_creds <- auto_load_aws_credentials()
     
     if (!is.null(auto_creds)) {
+      # Pre-populate form fields
       updateTextInput(session, "aws_access_key", value = auto_creds$access_key)
       updateTextInput(session, "aws_secret_key", value = auto_creds$secret_key)
       updateSelectInput(session, "aws_region", selected = auto_creds$region)
       updateTextInput(session, "s3_bucket", value = auto_creds$bucket)
       
       values$processing_log <- paste0(
-        "✅ Auto-loaded credentials from ", auto_creds$source
+        "✅ Auto-loaded credentials from ", auto_creds$source, "\n",
+        "🔑 Access Key: ", substr(auto_creds$access_key, 1, 8), "...\n",
+        "🌍 Region: ", auto_creds$region, "\n",
+        "🪣 Bucket: ", auto_creds$bucket
       )
       
-      if (auto_creds$bucket != "") {
-        values$processing_log <- paste(values$processing_log, "\n🔄 Ready for connection test")
+      # Auto-test connection if we have all required info
+      if (auto_creds$bucket != "" && auto_creds$access_key != "") {
+        values$processing_log <- paste(values$processing_log, "\n🔄 Auto-testing connection...")
+        
+        # Auto-trigger connection test after short delay
+        if (requireNamespace("shinyjs", quietly = TRUE)) {
+          shinyjs::delay(1000, {
+            if (input$s3_bucket != "" && input$aws_access_key != "") {
+              shinyjs::click("test_connection")
+            }
+          })
+        } else {
+          # Fallback without shinyjs
+          values$processing_log <- paste(values$processing_log, "\n✅ Ready - click 'Test Connection'")
+        }
       }
+      
+      # Update connection status immediately
+      output$connection_status <- renderText({
+        paste0("🤖 Credentials loaded from ", auto_creds$source, "\n",
+               "Ready to test connection...")
+      })
+    } else {
+      # No auto-credentials found
+      values$processing_log <- paste0(
+        "⚠️ No environment variables found\n",
+        "Please enter credentials manually\n\n",
+        "Expected variables:\n",
+        "- AWS_ACCESS_KEY_ID\n", 
+        "- AWS_SECRET_ACCESS_KEY\n",
+        "- AWS_S3_BUCKET\n",
+        "- AWS_DEFAULT_REGION"
+      )
+      
+      output$connection_status <- renderText({
+        "📝 Please enter AWS credentials manually"
+      })
     }
   })
   
-  # Test connection
+  # Test connection with better error handling and feedback
   observeEvent(input$test_connection, {
     req(input$aws_access_key, input$aws_secret_key, input$s3_bucket)
     
+    # Show immediate feedback
+    output$connection_status <- renderText({
+      "🔄 Testing connection... Please wait..."
+    })
+    
     withProgress(message = "Testing AWS connection...", value = 0, {
       tryCatch({
-        incProgress(0.3, detail = "Configuring credentials...")
-        configure_aws(input$aws_access_key, input$aws_secret_key, input$aws_region)
+        incProgress(0.2, detail = "Validating inputs...")
+        
+        # Validate inputs
+        if (nchar(input$aws_access_key) < 10) {
+          stop("Access Key appears to be too short")
+        }
+        if (nchar(input$aws_secret_key) < 20) {
+          stop("Secret Key appears to be too short") 
+        }
+        if (input$s3_bucket == "") {
+          stop("Bucket name is required")
+        }
+        
+        incProgress(0.4, detail = "Configuring AWS credentials...")
+        
+        # Configure AWS
+        region <- if (input$aws_region == "custom") input$custom_region else input$aws_region
+        configure_aws(input$aws_access_key, input$aws_secret_key, region)
+        
+        # Debug: Print environment variables (safely)
+        cat("Debug - AWS_ACCESS_KEY_ID set:", Sys.getenv("AWS_ACCESS_KEY_ID") != "", "\n")
+        cat("Debug - AWS_SECRET_ACCESS_KEY set:", Sys.getenv("AWS_SECRET_ACCESS_KEY") != "", "\n")
+        cat("Debug - AWS_DEFAULT_REGION:", Sys.getenv("AWS_DEFAULT_REGION"), "\n")
         
         incProgress(0.6, detail = "Testing bucket access...")
+        
+        # Test bucket access with detailed error reporting
         test_objects <- list_s3_objects(input$s3_bucket, "", max_keys = 1)
+        
+        # Check if we got an error response
+        if (nrow(test_objects) == 1 && test_objects$type[1] == "error") {
+          stop(paste("S3 Error:", test_objects$display_name[1]))
+        }
+        
+        incProgress(0.8, detail = "Verifying permissions...")
+        
+        # Additional verification - try to list a specific path
+        tryCatch({
+          mace_objects <- list_s3_objects(input$s3_bucket, "mace/", max_keys = 1)
+          cat("Debug - Found mace objects:", nrow(mace_objects), "\n")
+        }, error = function(e) {
+          cat("Debug - Could not access mace/ folder:", e$message, "\n")
+        })
         
         incProgress(1.0, detail = "Success!")
         
         values$aws_configured <- TRUE
         values$current_s3_path <- "mace/output-file/"
         
+        # Update sidebar status indicator
         output$connection_status_indicator <- renderUI({
           div(style = "background: #27ae60; padding: 10px; border-radius: 6px; border-left: 4px solid #2ecc71;",
               div(style = "color: white; font-size: 0.85em; font-weight: 500; margin-bottom: 3px;",
@@ -583,15 +678,36 @@ server <- function(input, output, session) {
         output$connection_status <- renderText({
           paste("✅ Connection successful!\n",
                 "Bucket:", input$s3_bucket, "\n",
-                "Region:", input$aws_region, "\n",
-                "Ready to browse files.")
+                "Region:", region, "\n",
+                "Objects found:", nrow(test_objects), "\n",
+                "Ready to browse files!")
         })
         
-        updateTabItems(session, "tabs", "s3_browse")
+        # Show success notification
+        showNotification(
+          "Successfully connected to S3!",
+          type = "message",
+          duration = 3
+        )
+        
+        # Auto-switch to browse tab after short delay
+        if (requireNamespace("shinyjs", quietly = TRUE)) {
+          shinyjs::delay(2000, {
+            updateTabItems(session, "tabs", "s3_browse")
+          })
+        } else {
+          # Immediate switch without delay
+          updateTabItems(session, "tabs", "s3_browse")
+        }
         
       }, error = function(e) {
         values$aws_configured <- FALSE
         
+        # Detailed error message
+        error_msg <- e$message
+        cat("Connection error:", error_msg, "\n")
+        
+        # Update sidebar status indicator
         output$connection_status_indicator <- renderUI({
           div(style = "background: #e74c3c; padding: 10px; border-radius: 6px; border-left: 4px solid #c0392b;",
               div(style = "color: white; font-size: 0.85em; font-weight: 500; margin-bottom: 3px;",
@@ -601,9 +717,36 @@ server <- function(input, output, session) {
           )
         })
         
+        # Provide helpful error messages
+        helpful_msg <- if (grepl("SSL", error_msg)) {
+          "SSL/Network issue - check firewall settings"
+        } else if (grepl("Access Denied|403", error_msg)) {
+          "Access denied - check IAM permissions (s3:ListBucket, s3:GetObject)"
+        } else if (grepl("No such bucket|404", error_msg)) {
+          "Bucket not found - check bucket name spelling"
+        } else if (grepl("too short", error_msg)) {
+          "Credential format issue - check Access Key and Secret Key"
+        } else {
+          "Check credentials and bucket name"
+        }
+        
         output$connection_status <- renderText({
-          paste("❌ Connection failed:\n", e$message)
+          paste("❌ Connection failed:\n", 
+                error_msg, "\n\n",
+                "💡 Suggestion:", helpful_msg, "\n\n",
+                "🔍 Debug info:\n",
+                "- Access Key length:", nchar(input$aws_access_key), "\n",
+                "- Secret Key length:", nchar(input$aws_secret_key), "\n",
+                "- Bucket:", input$s3_bucket, "\n",
+                "- Region:", region)
         })
+        
+        # Show error notification
+        showNotification(
+          paste("Connection failed:", helpful_msg),
+          type = "error",
+          duration = 5
+        )
       })
     })
   })
