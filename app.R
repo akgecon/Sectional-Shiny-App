@@ -560,18 +560,18 @@ server <- function(input, output, session) {
       updateSelectInput(session, "aws_region", selected = auto_creds$region)
       updateTextInput(session, "s3_bucket", value = auto_creds$bucket)
       
-      # Update processing log with detailed info
+      # Update processing log with plain text (no unicode)
       values$processing_log <- paste0(
-        "✅ Auto-loaded from ", auto_creds$source, "\n",
-        "🔑 Access Key: ", substr(auto_creds$access_key, 1, 8), "...\n",
-        "🌍 Region: ", auto_creds$region, "\n",
-        "🪣 Bucket: ", auto_creds$bucket, "\n\n",
-        if (auto_creds$bucket != "") "✅ Ready to test connection!" else "⚠️ Set bucket name and test connection"
+        "SUCCESS: Auto-loaded from ", auto_creds$source, "\n",
+        "Access Key: ", substr(auto_creds$access_key, 1, 8), "...\n",
+        "Region: ", auto_creds$region, "\n",
+        "Bucket: ", auto_creds$bucket, "\n\n",
+        if (auto_creds$bucket != "") "READY: Click Test Connection!" else "WARNING: Set bucket name and test connection"
       )
       
-      # Update connection status
+      # Update connection status (plain text)
       output$connection_status <- renderText({
-        paste0("🤖 Credentials loaded from ", auto_creds$source, "\n",
+        paste0("AUTO-LOADED: Credentials from ", auto_creds$source, "\n",
                "Access Key: ", substr(auto_creds$access_key, 1, 8), "...\n",
                "Region: ", auto_creds$region, "\n",
                "Bucket: ", auto_creds$bucket, "\n",
@@ -677,7 +677,7 @@ server <- function(input, output, session) {
         })
         
         output$connection_status <- renderText({
-          paste("✅ Connection successful!\n",
+          paste("SUCCESS: Connection successful!\n",
                 "Bucket:", input$s3_bucket, "\n",
                 "Region:", region, "\n",
                 "Objects found:", nrow(test_objects), "\n",
@@ -752,15 +752,18 @@ server <- function(input, output, session) {
     })
   })
   
-  # S3 file listing and navigation (simplified for space)
+  # S3 file listing and navigation - COMPLETE IMPLEMENTATION
   load_s3_objects <- reactive({
     req(values$aws_configured, input$s3_bucket)
     
     tryCatch({
+      cat("Loading S3 objects from path:", values$current_s3_path, "\n")
       objects <- list_s3_objects(input$s3_bucket, values$current_s3_path)
+      cat("Found", nrow(objects), "objects\n")
       values$s3_objects <- objects
       return(objects)
     }, error = function(e) {
+      cat("Error loading S3 objects:", e$message, "\n")
       return(data.frame(
         name = paste("Error:", e$message),
         display_name = "Error loading files",
@@ -772,20 +775,305 @@ server <- function(input, output, session) {
     })
   })
   
-  # Other server functions would continue here...
-  # (File selection, download, processing, charts, etc.)
-  # Abbreviated for space, but would include all the functionality
-  
-  # Minimal outputs for deployment testing
-  output$s3_processing_log <- renderText({
-    values$processing_log
+  # Refresh S3 listing
+  observeEvent(input$refresh_s3, {
+    if (values$aws_configured) {
+      load_s3_objects()
+      values$processing_log <- paste(values$processing_log, "\nS3 listing refreshed.")
+    }
   })
   
-  output$s3_file_list <- DT::renderDataTable({
-    data.frame(Message = "S3 integration ready - test connection first")
-  }, options = list(dom = 't'))
+  # Auto-load when browse tab is accessed - with better debugging
+  observeEvent(input$tabs, {
+    cat("Tab changed to:", input$tabs, "\n")
+    
+    if (input$tabs == "s3_browse") {
+      cat("Browse tab accessed. AWS configured:", values$aws_configured, "\n")
+      
+      if (values$aws_configured) {
+        cat("Loading S3 objects from current path:", values$current_s3_path, "\n")
+        
+        # Force load S3 objects
+        tryCatch({
+          objects <- list_s3_objects(input$s3_bucket, values$current_s3_path)
+          values$s3_objects <- objects
+          cat("Successfully loaded", nrow(objects), "objects\n")
+          
+          # Update processing log
+          values$processing_log <- paste(values$processing_log, 
+                                         "\nBrowse tab accessed - loaded", nrow(objects), "objects from", values$current_s3_path)
+          
+        }, error = function(e) {
+          cat("Error loading objects:", e$message, "\n")
+          values$processing_log <- paste(values$processing_log, "\nError loading files:", e$message)
+        })
+      } else {
+        values$processing_log <- paste(values$processing_log, "\nCannot browse - AWS not configured")
+      }
+    }
+  })
   
-  # Placeholder outputs
+  # Jump to output folder
+  observeEvent(input$jump_to_output, {
+    values$current_s3_path <- "mace/output-file/"
+    load_s3_objects()
+    values$selected_file <- NULL
+  }, ignoreInit = TRUE)
+  
+  # Breadcrumb navigation
+  output$breadcrumb_nav <- renderUI({
+    if (!values$aws_configured) {
+      return(p("Configure AWS credentials first"))
+    }
+    
+    bucket_name <- input$s3_bucket
+    current_path <- values$current_s3_path
+    
+    # Build breadcrumb
+    if (current_path == "" || current_path == "/") {
+      path_parts <- character(0)
+    } else {
+      path_parts <- strsplit(gsub("/$", "", current_path), "/")[[1]]
+    }
+    
+    # Create breadcrumb HTML
+    crumbs <- list()
+    
+    # Root bucket
+    crumbs <- append(crumbs, 
+                     list(tags$a(href = "#", onclick = "Shiny.setInputValue('navigate_to', '', {priority: 'event'});",
+                                 paste("Bucket:", bucket_name))))
+    
+    # Path parts
+    if (length(path_parts) > 0) {
+      for (i in 1:length(path_parts)) {
+        path_to_here <- paste(path_parts[1:i], collapse = "/") 
+        if (path_to_here != "") path_to_here <- paste0(path_to_here, "/")
+        
+        if (i == length(path_parts)) {
+          # Current folder (no link)
+          crumbs <- append(crumbs, list(span(paste("Folder:", path_parts[i]))))
+        } else {
+          # Clickable path
+          crumbs <- append(crumbs, 
+                           list(tags$a(href = "#", 
+                                       onclick = paste0("Shiny.setInputValue('navigate_to', '", path_to_here, "', {priority: 'event'});"),
+                                       paste("Folder:", path_parts[i]))))
+        }
+      }
+    }
+    
+    # Join with separators
+    breadcrumb_html <- list()
+    for (i in 1:length(crumbs)) {
+      breadcrumb_html <- append(breadcrumb_html, crumbs[i])
+      if (i < length(crumbs)) {
+        breadcrumb_html <- append(breadcrumb_html, list(span(" > ")))
+      }
+    }
+    
+    return(div(breadcrumb_html))
+  })
+  
+  # Handle breadcrumb navigation
+  observeEvent(input$navigate_to, {
+    values$current_s3_path <- input$navigate_to
+    load_s3_objects()
+    values$selected_file <- NULL
+  })
+  
+  # S3 file list table - with better error handling
+  output$s3_file_list <- DT::renderDataTable({
+    cat("Rendering S3 file list. AWS configured:", values$aws_configured, "\n")
+    
+    if (!values$aws_configured) {
+      return(DT::datatable(
+        data.frame(Message = "Please test AWS connection first"),
+        options = list(dom = 't'), 
+        rownames = FALSE
+      ))
+    }
+    
+    # Try to load objects
+    objects <- tryCatch({
+      load_s3_objects()
+    }, error = function(e) {
+      cat("Error in load_s3_objects:", e$message, "\n")
+      data.frame(
+        name = "Error",
+        display_name = paste("Error:", e$message),
+        type = "error",
+        size = NA,
+        last_modified = NA,
+        stringsAsFactors = FALSE
+      )
+    })
+    
+    cat("Objects loaded for display:", nrow(objects), "\n")
+    
+    if (is.null(objects) || nrow(objects) == 0) {
+      return(DT::datatable(
+        data.frame(Message = paste("No files found in:", values$current_s3_path)),
+        options = list(dom = 't'), 
+        rownames = FALSE
+      ))
+    }
+    
+    # Process display data (same as before)
+    display_data <- tryCatch({
+      clean_data <- data.frame(
+        Name = character(nrow(objects)),
+        Size = character(nrow(objects)),
+        Modified = character(nrow(objects)),
+        stringsAsFactors = FALSE
+      )
+      
+      for (i in 1:nrow(objects)) {
+        obj <- objects[i, ]
+        icon <- if (obj$type == "folder") "[FOLDER]" else "[FILE]"
+        clean_data$Name[i] <- paste(icon, obj$display_name)
+        
+        if (obj$type == "folder") {
+          clean_data$Size[i] <- ""
+        } else if (is.na(obj$size) || is.null(obj$size)) {
+          clean_data$Size[i] <- ""
+        } else {
+          size_num <- as.numeric(obj$size)
+          if (is.na(size_num)) {
+            clean_data$Size[i] <- ""
+          } else if (size_num < 1024) {
+            clean_data$Size[i] <- paste(size_num, "B")
+          } else if (size_num < 1024^2) {
+            clean_data$Size[i] <- paste(round(size_num / 1024, 1), "KB")
+          } else if (size_num < 1024^3) {
+            clean_data$Size[i] <- paste(round(size_num / 1024^2, 1), "MB")
+          } else {
+            clean_data$Size[i] <- paste(round(size_num / 1024^3, 1), "GB")
+          }
+        }
+        
+        if (obj$type == "folder" || is.na(obj$last_modified) || obj$last_modified == "") {
+          clean_data$Modified[i] <- ""
+        } else {
+          tryCatch({
+            parsed_date <- as.POSIXct(obj$last_modified)
+            clean_data$Modified[i] <- if (is.na(parsed_date)) obj$last_modified else format(parsed_date, "%Y-%m-%d %H:%M")
+          }, error = function(e) {
+            clean_data$Modified[i] <- obj$last_modified
+          })
+        }
+      }
+      
+      clean_data
+      
+    }, error = function(e) {
+      data.frame(
+        Name = paste("DISPLAY ERROR:", e$message),
+        Size = "",
+        Modified = "",
+        stringsAsFactors = FALSE
+      )
+    })
+    
+    cat("Display data prepared with", nrow(display_data), "rows\n")
+    
+    DT::datatable(
+      display_data,
+      options = list(
+        pageLength = 20,
+        dom = 't',
+        scrollX = TRUE,
+        columnDefs = list(
+          list(className = 'dt-center', targets = c(1, 2))
+        )
+      ), 
+      selection = 'single', 
+      escape = FALSE,
+      rownames = FALSE
+    )
+  })
+  
+  # Handle file/folder selection - COMPLETE IMPLEMENTATION  
+  observeEvent(input$s3_file_list_rows_selected, {
+    req(input$s3_file_list_rows_selected)
+    
+    selected_row <- input$s3_file_list_rows_selected
+    objects <- values$s3_objects
+    
+    if (!is.null(objects) && selected_row <= nrow(objects)) {
+      selected_item <- objects[selected_row, ]
+      
+      cat("Selected item:", selected_item$display_name, "Type:", selected_item$type, "\n")
+      
+      if (selected_item$type == "folder") {
+        # Navigate into folder
+        new_path <- selected_item$name
+        values$current_s3_path <- new_path
+        load_s3_objects()
+        values$selected_file <- NULL
+        
+        values$processing_log <- paste(values$processing_log, "\nNavigated to:", new_path)
+        
+        # Clear download section
+        output$download_section_display <- renderUI({ div() })
+        
+      } else {
+        # Select file
+        values$selected_file <- selected_item
+        
+        cat("File selected for download:", selected_item$name, "\n")
+        
+        # Update file info display
+        output$selected_file_info <- renderUI({
+          file_size_display <- if (is.na(selected_item$size)) {
+            "Unknown"
+          } else {
+            size_num <- as.numeric(selected_item$size)
+            if (size_num < 1024^2) {
+              paste(round(size_num / 1024, 0), "KB")
+            } else if (size_num < 1024^3) {
+              paste(round(size_num / 1024^2, 1), "MB")
+            } else {
+              paste(round(size_num / 1024^3, 1), "GB")
+            }
+          }
+          
+          div(
+            style = "background: linear-gradient(135deg, #007bff 0%, #0056b3 100%); 
+                     color: white; padding: 12px; border-radius: 6px; margin-bottom: 15px;
+                     box-shadow: 0 2px 8px rgba(0,123,255,0.3);",
+            div(style = "font-weight: bold; font-size: 0.95em; margin-bottom: 6px;",
+                "SELECTED: ", substr(selected_item$display_name, 1, 30),
+                if(nchar(selected_item$display_name) > 30) "..." else ""),
+            div(style = "font-size: 0.8em; opacity: 0.9;",
+                "Size: ", file_size_display, " | Ready for analysis")
+          )
+        })
+        
+        # Show download section
+        output$download_section_display <- renderUI({
+          div(
+            actionButton("download_and_process", 
+                         "Download & Analyze", 
+                         class = "btn-success", 
+                         style = "width: 100%; height: 60px; margin-bottom: 12px; font-weight: bold; 
+                                  padding: 8px 4px; line-height: 1.2;"),
+            div(
+              style = "background: #f8f9fa; padding: 8px; border-radius: 4px; border: 1px solid #dee2e6;",
+              checkboxInput("rescale_volatility_s3", 
+                            "10% Volatility Target", 
+                            value = FALSE,
+                            width = "100%")
+            )
+          )
+        })
+        
+        values$processing_log <- paste(values$processing_log, "\nSelected file:", selected_item$display_name)
+      }
+    }
+  })
+  
+  # Value boxes
   output$total_return_box <- renderValueBox({
     valueBox(value = "Ready", subtitle = "Total Return", icon = icon("cloud"), color = "light-blue")
   })
